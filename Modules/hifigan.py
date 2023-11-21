@@ -2,12 +2,16 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
-from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
+#from torch.nn.utils import weight_norm
+from torch.nn.utils import remove_weight_norm
+from torch.nn.utils import spectral_norm
+from torch.nn.utils.parametrizations import weight_norm
 from .utils import init_weights, get_padding
 
 import math
 import random
 import numpy as np 
+import time
 
 LRELU_SLOPE = 0.1
 
@@ -67,9 +71,11 @@ class AdaINResBlock1(torch.nn.Module):
             xt = n1(x, s)
             xt = xt + (1 / a1) * (torch.sin(a1 * xt) ** 2)  # Snake1D
             xt = c1(xt)
+
             xt = n2(xt, s)
             xt = xt + (1 / a2) * (torch.sin(a2 * xt) ** 2)  # Snake1D
             xt = c2(xt)
+
             x = xt + x
         return x
 
@@ -118,6 +124,7 @@ class SineGen(torch.nn.Module):
         """ f0_values: (batchsize, length, dim)
             where dim indicates fundamental tone and overtones
         """
+        f0_values = f0_values
         # convert to F0 in rad. The interger part n can be ignored
         # because 2 * np.pi * n doesn't affect phase
         rad_values = (f0_values / self.sampling_rate) % 1
@@ -193,8 +200,8 @@ class SineGen(torch.nn.Module):
         output sine_tensor: tensor(batchsize=1, length, dim)
         output uv: tensor(batchsize=1, length, 1)
         """
-        f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim,
-                             device=f0.device)
+        #f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)  # unused
+
         # fundamental component
         fn = torch.multiply(f0, torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device))
 
@@ -261,11 +268,11 @@ class SourceModuleHnNSF(torch.nn.Module):
         # source for harmonic branch
         with torch.no_grad():
             sine_wavs, uv, _ = self.l_sin_gen(x)
-        sine_merge = self.l_tanh(self.l_linear(sine_wavs))
-
+        sine_merge = self.l_tanh(self.l_linear(sine_wavs.type(torch.float16)))
         # source for noise branch, in the same shape as uv
         noise = torch.randn_like(uv) * self.sine_amp / 3
         return sine_merge, noise, uv
+
 def padDiff(x):
     return F.pad(F.pad(x, (0,0,-1,1), 'constant', 0) - x, (0,0,0,-1), 'constant', 0)
 
@@ -319,20 +326,20 @@ class Generator(torch.nn.Module):
         self.conv_post.apply(init_weights)
 
     def forward(self, x, s, f0):
-        
+        print(f"generator forward with {self.num_upsamples} upsamples and {self.num_kernels} kernels")
         f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
-
         har_source, noi_source, uv = self.m_source(f0)
         har_source = har_source.transpose(1, 2)
         
+        start = time.monotonic()
+        # most time spent in this loop ~900ms
         for i in range(self.num_upsamples):
+            #print(x.dtype); print(self.alphas[i].dtype)
             x = x + (1 / self.alphas[i]) * (torch.sin(self.alphas[i] * x) ** 2)
             x_source = self.noise_convs[i](har_source)
             x_source = self.noise_res[i](x_source, s)
-            
             x = self.ups[i](x)
             x = x + x_source
-            
             xs = None
             for j in range(self.num_kernels):
                 if xs is None:
@@ -340,10 +347,11 @@ class Generator(torch.nn.Module):
                 else:
                     xs += self.resblocks[i*self.num_kernels+j](x, s)
             x = xs / self.num_kernels
+        duration = 1000*(time.monotonic() - start)
+        print(f"generator loop time: {duration:.2f} ms")
         x = x + (1 / self.alphas[i+1]) * (torch.sin(self.alphas[i+1] * x) ** 2)
         x = self.conv_post(x)
         x = torch.tanh(x)
-
         return x
 
     def remove_weight_norm(self):
@@ -422,6 +430,8 @@ class Decoder(nn.Module):
                 upsample_kernel_sizes=[20,10,6,4]):
         super().__init__()
         
+        use_fp16 = True
+        self.dtype = torch.float16 if use_fp16 else torch.float32
         self.decode = nn.ModuleList()
         
         self.encode = AdainResBlk1d(dim_in + 2, 1024, style_dim)
@@ -439,12 +449,13 @@ class Decoder(nn.Module):
             weight_norm(nn.Conv1d(512, 64, kernel_size=1)),
         )
         
-        
         self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, resblock_dilation_sizes, upsample_kernel_sizes)
 
         
     def forward(self, asr, F0_curve, N, s):
+        print("decoder forward")
         if self.training:
+            print("training")
             downlist = [0, 3, 7]
             F0_down = downlist[random.randint(0, 2)]
             downlist = [0, 3, 7, 15]
@@ -454,24 +465,34 @@ class Decoder(nn.Module):
             if N_down:
                 N = nn.functional.conv1d(N.unsqueeze(1), torch.ones(1, 1, N_down).to('cuda'), padding=N_down//2).squeeze(1)  / N_down
 
-        
+        start = time.monotonic()
         F0 = self.F0_conv(F0_curve.unsqueeze(1))
         N = self.N_conv(N.unsqueeze(1))
-        
+        duration = 1000*(time.monotonic() - start)
+        print(f"conv time: {duration:.2f} ms")
+
         x = torch.cat([asr, F0, N], axis=1)
+        start = time.monotonic()
         x = self.encode(x, s)
-        
+        duration = 1000*(time.monotonic() - start)
+        print(f"encode time: {duration:.2f} ms")
+
         asr_res = self.asr_res(asr)
         
         res = True
+        start = time.monotonic()
         for block in self.decode:
             if res:
                 x = torch.cat([x, asr_res, F0, N], axis=1)
             x = block(x, s)
             if block.upsample_type != "none":
                 res = False
-                
-        x = self.generator(x, s, F0_curve)
+        duration = 1000*(time.monotonic() - start)
+        print(f"decode blocks time: {duration:.2f} ms")
+        start = time.monotonic()
+        x = self.generator(x, s, F0_curve)  # most time here.. ~1000ms of ~1250ms
+        duration = 1000*(time.monotonic() - start)
+        print(f"generator fwd time: {duration:.2f} ms")
+
         return x
-    
     

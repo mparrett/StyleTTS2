@@ -10,8 +10,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
-
+#from torch.nn.utils import weight_norm
+from torch.nn.utils import remove_weight_norm
+from torch.nn.utils import spectral_norm
+from torch.nn.utils.parametrizations import weight_norm
 from Utils.ASR.models import ASRCNN
 from Utils.JDC.model import JDCNet
 
@@ -281,6 +283,17 @@ class LayerNorm(nn.Module):
         x = F.layer_norm(x, (self.channels,), self.gamma, self.beta, self.eps)
         return x.transpose(1, -1)
     
+class LambdaModule(nn.Module):
+    def __init__(self, lambd):
+        super().__init__()
+        import types
+        assert type(lambd) is types.LambdaType
+        self.lambd = lambd
+
+    def forward(self, x):
+        return self.lambd(x)
+
+
 class TextEncoder(nn.Module):
     def __init__(self, channels, kernel_size, depth, n_symbols, actv=nn.LeakyReLU(0.2)):
         super().__init__()
@@ -288,21 +301,26 @@ class TextEncoder(nn.Module):
 
         padding = (kernel_size - 1) // 2
         self.cnn = nn.ModuleList()
+        print(f"Depth of TextEncoder: {depth}")
+        training = False
         for _ in range(depth):
             self.cnn.append(nn.Sequential(
                 weight_norm(nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)),
                 LayerNorm(channels),
                 actv,
-                nn.Dropout(0.2),
+                nn.Dropout(0.2) if training else nn.Identity(),  # probably not 
             ))
         # self.cnn = nn.Sequential(*self.cnn)
 
         self.lstm = nn.LSTM(channels, channels//2, 1, batch_first=True, bidirectional=True)
 
     def forward(self, x, input_lengths, m):
+        # channels: 512, kernel_size: 5, padding: 2
+        # https://github.com/pytorch/pytorch/commit/b324711130c34f39eec743de5b4300ac1f2b4116 ???
         x = self.embedding(x)  # [B, T, emb]
         x = x.transpose(1, 2)  # [B, emb, T]
         m = m.to(input_lengths.device).unsqueeze(1)
+
         x.masked_fill_(m, 0.0)
         
         for c in self.cnn:
@@ -625,12 +643,16 @@ def build_model(args, text_aligner, pitch_extractor, bert):
                 gen_istft_n_fft=args.decoder.gen_istft_n_fft, gen_istft_hop_size=args.decoder.gen_istft_hop_size) 
     else:
         from Modules.hifigan import Decoder
-        decoder = Decoder(dim_in=args.hidden_dim, style_dim=args.style_dim, dim_out=args.n_mels,
+        decoder_args=dict(
+            dim_in=args.hidden_dim, style_dim=args.style_dim, dim_out=args.n_mels,
                 resblock_kernel_sizes = args.decoder.resblock_kernel_sizes,
                 upsample_rates = args.decoder.upsample_rates,
                 upsample_initial_channel=args.decoder.upsample_initial_channel,
                 resblock_dilation_sizes=args.decoder.resblock_dilation_sizes,
-                upsample_kernel_sizes=args.decoder.upsample_kernel_sizes) 
+                upsample_kernel_sizes=args.decoder.upsample_kernel_sizes
+        )
+        print(decoder_args)
+        decoder = Decoder(**decoder_args) 
         
     text_encoder = TextEncoder(channels=args.hidden_dim, kernel_size=5, depth=args.n_layer, n_symbols=args.n_token)
     
