@@ -1,11 +1,11 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
-#from torch.nn.utils import weight_norm
+from torch.nn import Conv1d, ConvTranspose1d
+from torch.nn.utils import weight_norm
 from torch.nn.utils import remove_weight_norm
-from torch.nn.utils import spectral_norm
-from torch.nn.utils.parametrizations import weight_norm
+#from torch.nn.utils import spectral_norm
+#from torch.nn.utils.parametrizations import weight_norm
 from .utils import init_weights, get_padding
 
 import math
@@ -244,9 +244,10 @@ class SourceModuleHnNSF(torch.nn.Module):
     """
 
     def __init__(self, sampling_rate, upsample_scale, harmonic_num=0, sine_amp=0.1,
-                 add_noise_std=0.003, voiced_threshod=0):
+                 add_noise_std=0.003, voiced_threshod=0, use_fp16=False):
         super(SourceModuleHnNSF, self).__init__()
-
+        self.dtype = torch.float32 if not use_fp16 else torch.float16
+        
         self.sine_amp = sine_amp
         self.noise_std = add_noise_std
 
@@ -258,6 +259,7 @@ class SourceModuleHnNSF(torch.nn.Module):
         self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
         self.l_tanh = torch.nn.Tanh()
 
+
     def forward(self, x):
         """
         Sine_source, noise_source = SourceModuleHnNSF(F0_sampled)
@@ -268,7 +270,7 @@ class SourceModuleHnNSF(torch.nn.Module):
         # source for harmonic branch
         with torch.no_grad():
             sine_wavs, uv, _ = self.l_sin_gen(x)
-        sine_merge = self.l_tanh(self.l_linear(sine_wavs.type(torch.float16)))
+        sine_merge = self.l_tanh(self.l_linear(sine_wavs.to(self.dtype)))
         # source for noise branch, in the same shape as uv
         noise = torch.randn_like(uv) * self.sine_amp / 3
         return sine_merge, noise, uv
@@ -277,7 +279,8 @@ def padDiff(x):
     return F.pad(F.pad(x, (0,0,-1,1), 'constant', 0) - x, (0,0,0,-1), 'constant', 0)
 
 class Generator(torch.nn.Module):
-    def __init__(self, style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, resblock_dilation_sizes, upsample_kernel_sizes):
+    def __init__(self, style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, 
+                 resblock_dilation_sizes, upsample_kernel_sizes, use_fp16):
         super(Generator, self).__init__()
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
@@ -286,7 +289,7 @@ class Generator(torch.nn.Module):
         self.m_source = SourceModuleHnNSF(
                     sampling_rate=24000,
                     upsample_scale=np.prod(upsample_rates),
-                    harmonic_num=8, voiced_threshod=10)
+                    harmonic_num=8, voiced_threshod=10, use_fp16=use_fp16)
 
         self.f0_upsamp = torch.nn.Upsample(scale_factor=np.prod(upsample_rates))
         self.noise_convs = nn.ModuleList()
@@ -324,6 +327,8 @@ class Generator(torch.nn.Module):
         self.conv_post = weight_norm(Conv1d(ch, 1, 7, 1, padding=3))
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
+
+        #torch.compile(self.resblocks) # not sure
 
     def forward(self, x, s, f0):
         print(f"generator forward with {self.num_upsamples} upsamples and {self.num_kernels} kernels")
@@ -427,10 +432,9 @@ class Decoder(nn.Module):
                 upsample_rates = [10,5,3,2],
                 upsample_initial_channel=512,
                 resblock_dilation_sizes=[[1,3,5], [1,3,5], [1,3,5]],
-                upsample_kernel_sizes=[20,10,6,4]):
+                upsample_kernel_sizes=[20,10,6,4], use_fp16=False):
         super().__init__()
-        
-        use_fp16 = True
+    
         self.dtype = torch.float16 if use_fp16 else torch.float32
         self.decode = nn.ModuleList()
         
@@ -449,7 +453,11 @@ class Decoder(nn.Module):
             weight_norm(nn.Conv1d(512, 64, kernel_size=1)),
         )
         
-        self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, resblock_dilation_sizes, upsample_kernel_sizes)
+        self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, 
+                                   resblock_dilation_sizes, upsample_kernel_sizes, use_fp16=use_fp16)
+
+        #torch.compile(self.decode)
+        #torch.compile(self.generator) # maybe helped shave some 100's of ms
 
         
     def forward(self, asr, F0_curve, N, s):

@@ -10,10 +10,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-#from torch.nn.utils import weight_norm
-from torch.nn.utils import remove_weight_norm
+from torch.nn.utils import weight_norm
+#from torch.nn.utils import remove_weight_norm
 from torch.nn.utils import spectral_norm
-from torch.nn.utils.parametrizations import weight_norm
+#from torch.nn.utils.parametrizations import weight_norm
+#from torch.nn.utils.parametrizations import spectral_norm  # careful, this works differently!
 from Utils.ASR.models import ASRCNN
 from Utils.JDC.model import JDCNet
 
@@ -629,7 +630,7 @@ def load_ASR_models(ASR_MODEL_PATH, ASR_MODEL_CONFIG):
 
     return asr_model
 
-def build_model(args, text_aligner, pitch_extractor, bert):
+def build_model(args, text_aligner, pitch_extractor, bert, use_fp16=False):
     assert args.decoder.type in ['istftnet', 'hifigan'], 'Decoder type unknown'
     
     if args.decoder.type == "istftnet":
@@ -649,10 +650,11 @@ def build_model(args, text_aligner, pitch_extractor, bert):
                 upsample_rates = args.decoder.upsample_rates,
                 upsample_initial_channel=args.decoder.upsample_initial_channel,
                 resblock_dilation_sizes=args.decoder.resblock_dilation_sizes,
-                upsample_kernel_sizes=args.decoder.upsample_kernel_sizes
+                upsample_kernel_sizes=args.decoder.upsample_kernel_sizes,
+                use_fp16=use_fp16
         )
         print(decoder_args)
-        decoder = Decoder(**decoder_args) 
+        decoder = Decoder(**decoder_args)
         
     text_encoder = TextEncoder(channels=args.hidden_dim, kernel_size=5, depth=args.n_layer, n_symbols=args.n_token)
     
