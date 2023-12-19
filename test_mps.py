@@ -171,8 +171,26 @@ def get_en(d_in, pred_aln_trg, dtype):
         en = asr_new
     return en
 
+def update_s_ref(s_pred, ref_s, alpha, beta):
+    s, ref = s_pred[:, 128:], s_pred[:, :128]
+    ref = alpha * ref + (1 - alpha)  * ref_s[:, :128]
+    s = beta * s + (1 - beta)  * ref_s[:, 128:]
+    return s, ref
 
-def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1, use_fp16=True):
+def update_pred_aln_trg(pred_aln_trg, pred_dur):
+    c_frame = 0
+    for i in range(pred_aln_trg.size(0)):
+        pred_aln_trg[i, c_frame:c_frame + int(pred_dur[i].data)] = 1
+        c_frame += int(pred_dur[i].data)
+    return pred_aln_trg
+
+def get_pred_dur(model, x):
+    duration = model.predictor.duration_proj(x)
+    duration = torch.sigmoid(duration).sum(axis=-1)
+    pred_dur = torch.round(duration.squeeze()).clamp(min=1)
+    return pred_dur
+
+def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1):
     tokens = tokenize(text, gpu_device)
     
     with torch.no_grad():
@@ -180,6 +198,7 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
         text_mask = length_to_mask(input_lengths)  # .to(gpu_device)
         t_en = model.text_encoder(tokens, input_lengths, text_mask)
 
+        # move all of these to the gpu device
         tokens = tokens.to(gpu_device)
         text_mask = text_mask.to(gpu_device)
         input_lengths = input_lengths.to(gpu_device)
@@ -191,14 +210,12 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
         noise = torch.randn((1, 256)).unsqueeze(1).to(gpu_device)
         # ref_s: reference from the same speaker as the embedding
         start = time.monotonic()
-        s_pred = sampler(noise = noise, embedding=bert_dur,
-            embedding_scale=embedding_scale, features=ref_s, num_steps=diffusion_steps).squeeze(1)
+        s_pred = sampler(noise = noise, embedding=bert_dur, embedding_scale=embedding_scale, 
+                         features=ref_s, num_steps=diffusion_steps).squeeze(1)
         duration = 1000*(time.monotonic() - start)
         print(f"Duration diffusion = {duration:.2f}ms")
         start = time.monotonic()
-        s, ref = s_pred[:, 128:], s_pred[:, :128]
-        ref = alpha * ref + (1 - alpha)  * ref_s[:, :128]
-        s = beta * s + (1 - beta)  * ref_s[:, 128:]
+        s, ref = update_s_ref(s_pred, ref_s, alpha, beta)
         d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
         duration = 1000*(time.monotonic() - start)
         print(f"Duration text_encoder = {duration:.2f}ms")
@@ -208,14 +225,9 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
         duration = 1000*(time.monotonic() - start)
         print(f"Duration lstm = {duration:.2f}ms")
 
-        duration = model.predictor.duration_proj(x)
-        duration = torch.sigmoid(duration).sum(axis=-1)
-        pred_dur = torch.round(duration.squeeze()).clamp(min=1)
+        pred_dur = get_pred_dur(model, x)
         pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
-        c_frame = 0
-        for i in range(pred_aln_trg.size(0)):
-            pred_aln_trg[i, c_frame:c_frame + int(pred_dur[i].data)] = 1
-            c_frame += int(pred_dur[i].data)
+        pred_aln_trg = update_pred_aln_trg(pred_aln_trg, pred_dur)
 
         # encode prosody
         en = get_en(d.transpose(-1, -2), pred_aln_trg, torch.float32)
@@ -223,9 +235,7 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
         asr = get_en(t_en, pred_aln_trg, USE_DTYPE)
 
         start = time.monotonic()
-        out = model.decoder(asr,
-                            F0_pred.to(USE_DTYPE),
-                            N_pred.to(USE_DTYPE),
+        out = model.decoder(asr, F0_pred.to(USE_DTYPE), N_pred.to(USE_DTYPE),
                             ref.squeeze().unsqueeze(0).to(USE_DTYPE))  ## this takes ~2000ms of 3500ms total
         duration = 1000*(time.monotonic() - start)
         print(f"Duration decoder = {duration:.2f}ms")
@@ -255,14 +265,9 @@ def LFinference(text, s_prev, ref_s, alpha = 0.3, beta = 0.7, t = 0.7, diffusion
           # convex combination of previous and current style
           s_pred = t * s_prev + (1 - t) * s_pred
 
-      s, ref = s_pred[:, 128:], s_pred[:, :128]
-      ref = alpha * ref + (1 - alpha)  * ref_s[:, :128]
-      s = beta * s + (1 - beta)  * ref_s[:, 128:]
-
+      s, ref = update_s_ref(s_pred, ref_s, alpha, beta)
       s_pred = torch.cat([ref, s], dim=-1)
-
       d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
-
       x, _ = model.predictor.lstm(d)
       duration = model.predictor.duration_proj(x)
 
@@ -295,7 +300,6 @@ def tokenize_st(text, gpu_device):
     tokens = torch.LongTensor(tokens).to(gpu_device).unsqueeze(0)
     return tokens
 
-
 def STinference(text, ref_s, ref_text, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1):
     tokens = tokenize_st(text, gpu_device)
     ref_tokens = tokenize_st(ref_text, gpu_device)
@@ -319,9 +323,7 @@ def STinference(text, ref_s, ref_text, alpha = 0.3, beta = 0.7, diffusion_steps=
             features=ref_s, # reference from the same speaker as the embedding
             num_steps=diffusion_steps).squeeze(1)
 
-        s, ref = s_pred[:, 128:], s_pred[:, :128]
-        ref = alpha * ref + (1 - alpha)  * ref_s[:, :128]
-        s = beta * s + (1 - beta)  * ref_s[:, 128:]
+        s, ref = update_s_ref(s_pred, ref_s, alpha, beta)
 
         d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
 
