@@ -32,9 +32,9 @@ from utils import *
 from torch.profiler import profile, record_function, ProfilerActivity
 
 USE_MPS = int(os.getenv("USE_MPS", 0))
-gpu_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+GPU_DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 if USE_MPS != 0:
-  gpu_device = 'mps' if torch.backends.mps.is_available() else 'cpu'  # TODO
+  GPU_DEVICE = 'mps' if torch.backends.mps.is_available() else 'cpu'  # TODO
 #device_cpu = 'cpu'
 
 
@@ -63,7 +63,7 @@ def compute_style(path):
     audio, index = librosa.effects.trim(wave, top_db=30)
     if sr != 24000:
         audio = librosa.resample(audio, sr, 24000)
-    mel_tensor = preprocess(audio).to(gpu_device)
+    mel_tensor = preprocess(audio).to(GPU_DEVICE)
     #display(mel_tensor)
     with torch.no_grad():
         ref_s = model.style_encoder(mel_tensor.unsqueeze(1))
@@ -96,15 +96,15 @@ plbert = load_plbert(BERT_path)
 
 model_params = recursive_munch(config['model_params'])
 
-USE_FP16 = True and USE_MPS
-USE_DTYPE=torch.float32 if not USE_FP16 else torch.float16
+USE_FP16 = USE_MPS and True and False
+USE_DTYPE=torch.float16 if USE_FP16 else torch.float32
 
 model = build_model(model_params, text_aligner, pitch_extractor, plbert, use_fp16=USE_FP16)
 
 for key in model:
     _ = model[key].eval()
     if key != 'text_encoder':
-        _ = model[key].to(gpu_device)
+        _ = model[key].to(GPU_DEVICE)
     if key == 'decoder':
         _ = model[key]
         #import code; code.interact(local=locals())
@@ -129,10 +129,11 @@ for key in model:
 #             except:
 #                 _load(params[key], model[key])
 
+# set us up the models
 _ = [model[key].eval() for key in model]
 for key in model:
   if key == 'decoder':
-    import code; code.interact(local=locals())
+    #import code; code.interact(local=locals())
     if USE_FP16:
         model[key].half()  # ?? 
 
@@ -163,7 +164,7 @@ def tokenize(text, gpu_device):
 
 
 def get_en(d_in, pred_aln_trg, dtype):
-    en = (d_in @ pred_aln_trg.unsqueeze(0).to(device=gpu_device, dtype=dtype))
+    en = (d_in @ pred_aln_trg.unsqueeze(0).to(device=GPU_DEVICE, dtype=dtype))
     if model_params.decoder.type == "hifigan":
         asr_new = torch.zeros_like(en)
         asr_new[:, :, 0] = en[:, :, 0]
@@ -191,7 +192,7 @@ def get_pred_dur(model, x):
     return pred_dur
 
 def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1):
-    tokens = tokenize(text, gpu_device)
+    tokens = tokenize(text, GPU_DEVICE)
     
     with torch.no_grad():
         input_lengths = torch.Tensor([tokens.shape[-1]]).to(dtype=torch.int64) #.to(gpu_device)
@@ -199,15 +200,15 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
         t_en = model.text_encoder(tokens, input_lengths, text_mask)
 
         # move all of these to the gpu device
-        tokens = tokens.to(gpu_device)
-        text_mask = text_mask.to(gpu_device)
-        input_lengths = input_lengths.to(gpu_device)
-        t_en = t_en.to(gpu_device)
+        tokens = tokens.to(GPU_DEVICE)
+        text_mask = text_mask.to(GPU_DEVICE)
+        input_lengths = input_lengths.to(GPU_DEVICE)
+        t_en = t_en.to(GPU_DEVICE)
 
         bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
         d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-        noise = torch.randn((1, 256)).unsqueeze(1).to(gpu_device)
+        noise = torch.randn((1, 256)).unsqueeze(1).to(GPU_DEVICE)
         # ref_s: reference from the same speaker as the embedding
         start = time.monotonic()
         s_pred = sampler(noise = noise, embedding=bert_dur, embedding_scale=embedding_scale, 
@@ -243,17 +244,17 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
 
 
 def LFinference(text, s_prev, ref_s, alpha = 0.3, beta = 0.7, t = 0.7, diffusion_steps=5, embedding_scale=1):
-  tokens = tokenize(text, gpu_device)
+  tokens = tokenize(text, GPU_DEVICE)
 
   with torch.no_grad():
-      input_lengths = torch.LongTensor([tokens.shape[-1]]).to(gpu_device)
-      text_mask = length_to_mask(input_lengths).to(gpu_device)
+      input_lengths = torch.LongTensor([tokens.shape[-1]]).to(GPU_DEVICE)
+      text_mask = length_to_mask(input_lengths).to(GPU_DEVICE)
 
       t_en = model.text_encoder(tokens, input_lengths, text_mask)
       bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
       d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-      noise = torch.randn((1, 256)).unsqueeze(1).to(gpu_device)
+      noise = torch.randn((1, 256)).unsqueeze(1).to(GPU_DEVICE)
       s_pred = sampler(
         noise = noise,
         embedding=bert_dur,
@@ -284,7 +285,7 @@ def LFinference(text, s_prev, ref_s, alpha = 0.3, beta = 0.7, t = 0.7, diffusion
       en = get_en(d.transpose(-1, -2), pred_aln_trg, torch.float32)
       F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
       en = get_en(t_en, pred_aln_trg, USE_DTYPE)
-      asr = (t_en @ pred_aln_trg.unsqueeze(0).to(gpu_device))
+      asr = (t_en @ pred_aln_trg.unsqueeze(0).to(GPU_DEVICE))
       out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
   return out.squeeze().cpu().numpy()[..., :-100], s_pred # weird pulse at the end of the model, need to be fixed later
 
@@ -301,21 +302,21 @@ def tokenize_st(text, gpu_device):
     return tokens
 
 def STinference(text, ref_s, ref_text, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1):
-    tokens = tokenize_st(text, gpu_device)
-    ref_tokens = tokenize_st(ref_text, gpu_device)
+    tokens = tokenize_st(text, GPU_DEVICE)
+    ref_tokens = tokenize_st(ref_text, GPU_DEVICE)
 
     with torch.no_grad():
-        input_lengths = torch.LongTensor([tokens.shape[-1]]).to(gpu_device)
-        text_mask = length_to_mask(input_lengths).to(gpu_device)
+        input_lengths = torch.LongTensor([tokens.shape[-1]]).to(GPU_DEVICE)
+        text_mask = length_to_mask(input_lengths).to(GPU_DEVICE)
 
         t_en = model.text_encoder(tokens, input_lengths, text_mask)
         bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
         d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-        ref_input_lengths = torch.LongTensor([ref_tokens.shape[-1]]).to(gpu_device)
+        ref_input_lengths = torch.LongTensor([ref_tokens.shape[-1]]).to(GPU_DEVICE)
         #ref_text_mask = length_to_mask(ref_input_lengths).to(gpu_device)
         #ref_bert_dur = model.bert(ref_tokens, attention_mask=(~ref_text_mask).int())
-        noise = torch.randn((1, 256)).unsqueeze(1).to(gpu_device)
+        noise = torch.randn((1, 256)).unsqueeze(1).to(GPU_DEVICE)
         s_pred = sampler(
             noise=noise,
             embedding=bert_dur,
@@ -355,8 +356,11 @@ def main():
   #### Basic synthesis (5 diffusion steps, seen speakers)
   """
 
-  text = ''' This is a mac computer! And StyleTTS 2 is a text to speech model that leverages style diffusion and adversarial training with large speech language models to achieve human level text to speech synthesis. ''' # @param {type:"string"}
+  text = "This is a mac computer! And StyleTTS 2 is a text to speech model that " + \
+         "leverages style diffusion and adversarial training with large speech language models " + \
+        "to achieve human level text to speech synthesis." # @param {type:"string"}
   text = " This is a test of the emergency broadcast system. "
+
   import subprocess
   reference_dicts = {}
   #reference_dicts['696_92939'] = "Demo/reference_audio/696_92939_000016_000006.wav"
@@ -364,11 +368,12 @@ def main():
   #reference_dicts['1221-135767'] = "Demo/reference_audio/1221-135767-0014.wav"
   #reference_dicts['908-157963-0027'] = "Demo/reference_audio/908-157963-0027.wav"
   #reference_dicts['matt2'] = "matt2.wav"
-  reference_dicts['attenb2'] = "attenb2.wav"
-  #reference_dicts['trent_84_6s'] = "trent_84_6s.wav"
+  #reference_dicts['attenb2'] = "audios/attenb2.wav"
+  reference_dicts['trent_84_6s'] = "audios/trent_84_6s.wav"
+  
   #This setting uses 70% of the reference timbre and 30% of the reference prosody
   # alpha=0.3, beta=0.7,
-  print(gpu_device)
+  print(GPU_DEVICE)
   styles = {}
   import soundfile as sf
   style_k = list(reference_dicts.keys())[0]
