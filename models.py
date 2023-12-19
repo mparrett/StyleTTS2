@@ -346,7 +346,6 @@ class TextEncoder(nn.Module):
         x = x_pad.to(x.device)
         
         x.masked_fill_(m, 0.0)
-        
         return x
 
     def inference(self, x):
