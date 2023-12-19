@@ -1,0 +1,14 @@
+SoundFile
+munch
+pydub
+pyyaml
+nltk
+matplotlib
+phonemizer
+einops
+einops-exts
+tqdm
+typing-extensions
+git+https://github.com/resemble-ai/monotonic_align.git
+transformers
+accelerate

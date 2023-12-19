@@ -1,0 +1,26 @@
+name: py3.10.12_arm64-torch2-styletts2
+channels:
+  - pytorch
+  - pytorch-nightly
+# - conda-forge
+  - defaults
+dependencies:
+  - python=3.10.12
+  - pytorch-nightly::pytorch>=2.1.1
+  - torchaudio
+  - torchvision
+#  - transformers>=4.35.2
+#  - accelerate>=0.24.1
+  - librosa>=0.10.1
+  - numpy
+  - scipy
+  - numexpr
+  - scikit-learn
+  - llvm-openmp
+  - ipython
+  - ipykernel
+  - cython
+  - pip
+  - pip:
+    - pip-tools
+prefix: /Users/matt/miniconda3/envs/py3.10.12_arm64-torch2-styletts2
