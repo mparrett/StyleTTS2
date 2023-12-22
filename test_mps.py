@@ -28,6 +28,9 @@ from nltk.tokenize import word_tokenize
 from models import *
 from utils import *
 
+from contextlib import contextmanager
+
+from test_utils import Timed
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
@@ -101,41 +104,44 @@ USE_DTYPE=torch.float16 if USE_FP16 else torch.float32
 
 model = build_model(model_params, text_aligner, pitch_extractor, plbert, use_fp16=USE_FP16)
 
-for key in model:
-    _ = model[key].eval()
-    if key != 'text_encoder':
-        _ = model[key].to(GPU_DEVICE)
-    if key == 'decoder':
-        _ = model[key]
-        #import code; code.interact(local=locals())
+def update_model_params(model):
+    for key in model:
+        _ = model[key].eval()
+        if key != 'text_encoder':
+            _ = model[key].to(GPU_DEVICE)
+        if key == 'decoder':
+            _ = model[key]
+            #import code; code.interact(local=locals())
 
-params_whole = torch.load("Models/LibriTTS/epochs_2nd_00020.pth", map_location='cpu')
-params = params_whole['net']
+    params_whole = torch.load("Models/LibriTTS/epochs_2nd_00020.pth", map_location='cpu')  # not sure about map location cpu here
+    params = params_whole['net']
 
-for key in model:
-    if key in params:
-        print('%s loaded' % key)
-        try:
-            model[key].load_state_dict(params[key])
-        except:
-            from collections import OrderedDict
-            state_dict = params[key]
-            new_state_dict = OrderedDict()
-            for style_k, v in state_dict.items():
-                name = style_k[7:] # remove `module.`
-                new_state_dict[name] = v
-            # load params
-            model[key].load_state_dict(new_state_dict, strict=False)
-#             except:
-#                 _load(params[key], model[key])
+    for key in model:
+        if key in params:
+            print('%s loaded' % key)
+            try:
+                model[key].load_state_dict(params[key])
+            except:
+                from collections import OrderedDict
+                state_dict = params[key]
+                new_state_dict = OrderedDict()
+                for style_k, v in state_dict.items():
+                    name = style_k[7:] # remove `module.`
+                    new_state_dict[name] = v
+                # load params
+                model[key].load_state_dict(new_state_dict, strict=False)
+    #             except:
+    #                 _load(params[key], model[key])
 
-# set us up the models
-_ = [model[key].eval() for key in model]
-for key in model:
-  if key == 'decoder':
-    #import code; code.interact(local=locals())
-    if USE_FP16:
-        model[key].half()  # ?? 
+    # set eval; half if using fp16 for decoder
+    _ = [model[key].eval() for key in model]
+    for key in model:
+        if key == 'decoder':
+            #import code; code.interact(local=locals())
+            if USE_FP16:
+                model[key].half()  # ?? 
+
+update_model_params(model)
 
 from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
 
@@ -145,8 +151,9 @@ sampler = DiffusionSampler(
     sigma_schedule=KarrasSchedule(sigma_min=0.0001, sigma_max=3.0, rho=9.0), # empirical parameters
     clamp=False
 )
+
+@Timed()
 def tokenize(text, gpu_device):
-    start = time.monotonic()
     text = text.strip()
     ps = global_phonemizer.phonemize([text])
     ps = word_tokenize(ps[0])
@@ -157,13 +164,12 @@ def tokenize(text, gpu_device):
     tokens = textclenaer(ps)
     tokens.insert(0, 0)
     #tokens = torch.LongTensor(tokens).to(gpu_device).unsqueeze(0)
-    tokens = torch.LongTensor(tokens).unsqueeze(0)  #.to(gpu_device) # because doesn't run on MPS
-    duration = 1000*(time.monotonic() - start)
-    print(f"Duration tokenize = {duration:.2f}ms")
+    tokens = torch.LongTensor(tokens).unsqueeze(0)  #.to(gpu_device) # don't move to GPU because decoder is on CPU (mps-related)
     return tokens
 
-
-def get_en(d_in, pred_aln_trg, dtype):
+@Timed()
+def get_input_for_prosody(d_in, pred_aln_trg, dtype):
+    """Get input for prosody. The method supports HiFi-GAN decoder adjustments."""
     en = (d_in @ pred_aln_trg.unsqueeze(0).to(device=GPU_DEVICE, dtype=dtype))
     if model_params.decoder.type == "hifigan":
         asr_new = torch.zeros_like(en)
@@ -172,32 +178,40 @@ def get_en(d_in, pred_aln_trg, dtype):
         en = asr_new
     return en
 
-def update_s_ref(s_pred, ref_s, alpha, beta):
+@Timed()
+def blend_predict_and_reference(s_pred, ref_s, alpha, beta):
+    """Blend predicted and reference speech signals using alpha and beta weighting coefficients."""
     s, ref = s_pred[:, 128:], s_pred[:, :128]
     ref = alpha * ref + (1 - alpha)  * ref_s[:, :128]
     s = beta * s + (1 - beta)  * ref_s[:, 128:]
     return s, ref
 
-def update_pred_aln_trg(pred_aln_trg, pred_dur):
+@Timed()
+def update_align_target(pred_aln_trg, pred_dur):
+    """Update the alignment target tensor based on the predicted durations."""
     c_frame = 0
     for i in range(pred_aln_trg.size(0)):
         pred_aln_trg[i, c_frame:c_frame + int(pred_dur[i].data)] = 1
         c_frame += int(pred_dur[i].data)
     return pred_aln_trg
 
-def get_pred_dur(model, x):
+@Timed()
+def calc_predicted_durations(model, x):
+    """Calculate predicted durations from the model's output."""
     duration = model.predictor.duration_proj(x)
     duration = torch.sigmoid(duration).sum(axis=-1)
     pred_dur = torch.round(duration.squeeze()).clamp(min=1)
     return pred_dur
 
+@Timed()
 def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1):
     tokens = tokenize(text, GPU_DEVICE)
     
     with torch.no_grad():
         input_lengths = torch.Tensor([tokens.shape[-1]]).to(dtype=torch.int64) #.to(gpu_device)
         text_mask = length_to_mask(input_lengths)  # .to(gpu_device)
-        t_en = model.text_encoder(tokens, input_lengths, text_mask)
+        with Timed("text encoder 1"):
+            t_en = model.text_encoder(tokens, input_lengths, text_mask)
 
         # move all of these to the gpu device
         tokens = tokens.to(GPU_DEVICE)
@@ -210,39 +224,34 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
 
         noise = torch.randn((1, 256)).unsqueeze(1).to(GPU_DEVICE)
         # ref_s: reference from the same speaker as the embedding
-        start = time.monotonic()
-        s_pred = sampler(noise = noise, embedding=bert_dur, embedding_scale=embedding_scale, 
-                         features=ref_s, num_steps=diffusion_steps).squeeze(1)
-        duration = 1000*(time.monotonic() - start)
-        print(f"Duration diffusion = {duration:.2f}ms")
-        start = time.monotonic()
-        s, ref = update_s_ref(s_pred, ref_s, alpha, beta)
-        d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
-        duration = 1000*(time.monotonic() - start)
-        print(f"Duration text_encoder = {duration:.2f}ms")
+        with Timed("sampler"):
+            s_pred = sampler(noise = noise, embedding=bert_dur, embedding_scale=embedding_scale, 
+                             features=ref_s, num_steps=diffusion_steps).squeeze(1)
 
-        start = time.monotonic()
-        x, _ = model.predictor.lstm(d)
-        duration = 1000*(time.monotonic() - start)
-        print(f"Duration lstm = {duration:.2f}ms")
+        s, ref = blend_predict_and_reference(s_pred, ref_s, alpha, beta)
+        with Timed("text encoder 2"):
+            d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
 
-        pred_dur = get_pred_dur(model, x)
+        with Timed("predictor.lstm"):
+            x, _ = model.predictor.lstm(d)
+
+        pred_dur = calc_predicted_durations(model, x)
         pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
-        pred_aln_trg = update_pred_aln_trg(pred_aln_trg, pred_dur)
+        pred_aln_trg = update_align_target(pred_aln_trg, pred_dur)
 
         # encode prosody
-        en = get_en(d.transpose(-1, -2), pred_aln_trg, torch.float32)
+        en = get_input_for_prosody(d.transpose(-1, -2), pred_aln_trg, torch.float32)
         F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
-        asr = get_en(t_en, pred_aln_trg, USE_DTYPE)
+        asr = get_input_for_prosody(t_en, pred_aln_trg, USE_DTYPE)
 
-        start = time.monotonic()
-        out = model.decoder(asr, F0_pred.to(USE_DTYPE), N_pred.to(USE_DTYPE),
-                            ref.squeeze().unsqueeze(0).to(USE_DTYPE))  ## this takes ~2000ms of 3500ms total
-        duration = 1000*(time.monotonic() - start)
-        print(f"Duration decoder = {duration:.2f}ms")
+        with Timed("model.decoder"):
+            out = model.decoder(asr, F0_pred.to(USE_DTYPE), N_pred.to(USE_DTYPE),
+                                ref.squeeze().unsqueeze(0).to(USE_DTYPE))  ## this takes ~2000ms of 3500ms total
+
     return out.type(torch.float32).squeeze().cpu().numpy()[..., :-50] # weird pulse at the end of the model, need to be fixed later
 
 
+@Timed()
 def LFinference(text, s_prev, ref_s, alpha = 0.3, beta = 0.7, t = 0.7, diffusion_steps=5, embedding_scale=1):
   tokens = tokenize(text, GPU_DEVICE)
 
@@ -255,18 +264,19 @@ def LFinference(text, s_prev, ref_s, alpha = 0.3, beta = 0.7, t = 0.7, diffusion
       d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
       noise = torch.randn((1, 256)).unsqueeze(1).to(GPU_DEVICE)
-      s_pred = sampler(
-        noise = noise,
-        embedding=bert_dur,
-        embedding_scale=embedding_scale,
-        features=ref_s, # reference from the same speaker as the embedding
-        num_steps=diffusion_steps).squeeze(1)
+      with Timed("Sampler"):
+        s_pred = sampler(
+            noise = noise,
+            embedding=bert_dur,
+            embedding_scale=embedding_scale,
+            features=ref_s, # reference from the same speaker as the embedding
+            num_steps=diffusion_steps).squeeze(1)
 
       if s_prev is not None:
           # convex combination of previous and current style
           s_pred = t * s_prev + (1 - t) * s_pred
 
-      s, ref = update_s_ref(s_pred, ref_s, alpha, beta)
+      s, ref = blend_predict_and_reference(s_pred, ref_s, alpha, beta)
       s_pred = torch.cat([ref, s], dim=-1)
       d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
       x, _ = model.predictor.lstm(d)
@@ -282,14 +292,14 @@ def LFinference(text, s_prev, ref_s, alpha = 0.3, beta = 0.7, t = 0.7, diffusion
           c_frame += int(pred_dur[i].data)
 
       # encode prosody
-      en = get_en(d.transpose(-1, -2), pred_aln_trg, torch.float32)
+      en = get_input_for_prosody(d.transpose(-1, -2), pred_aln_trg, torch.float32)
       F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
-      en = get_en(t_en, pred_aln_trg, USE_DTYPE)
+      en = get_input_for_prosody(t_en, pred_aln_trg, USE_DTYPE)
       asr = (t_en @ pred_aln_trg.unsqueeze(0).to(GPU_DEVICE))
       out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
   return out.squeeze().cpu().numpy()[..., :-100], s_pred # weird pulse at the end of the model, need to be fixed later
 
-
+@Timed()
 def tokenize_st(text, gpu_device):
     text = text.strip()
     ps = global_phonemizer.phonemize([text])
@@ -301,6 +311,7 @@ def tokenize_st(text, gpu_device):
     tokens = torch.LongTensor(tokens).to(gpu_device).unsqueeze(0)
     return tokens
 
+@Timed()
 def STinference(text, ref_s, ref_text, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1):
     tokens = tokenize_st(text, GPU_DEVICE)
     ref_tokens = tokenize_st(ref_text, GPU_DEVICE)
@@ -317,14 +328,15 @@ def STinference(text, ref_s, ref_text, alpha = 0.3, beta = 0.7, diffusion_steps=
         #ref_text_mask = length_to_mask(ref_input_lengths).to(gpu_device)
         #ref_bert_dur = model.bert(ref_tokens, attention_mask=(~ref_text_mask).int())
         noise = torch.randn((1, 256)).unsqueeze(1).to(GPU_DEVICE)
-        s_pred = sampler(
-            noise=noise,
-            embedding=bert_dur,
-            embedding_scale=embedding_scale,
-            features=ref_s, # reference from the same speaker as the embedding
-            num_steps=diffusion_steps).squeeze(1)
+        with Timed("Sampler"):
+            s_pred = sampler(
+                noise=noise,
+                embedding=bert_dur,
+                embedding_scale=embedding_scale,
+                features=ref_s, # reference from the same speaker as the embedding
+                num_steps=diffusion_steps).squeeze(1)
 
-        s, ref = update_s_ref(s_pred, ref_s, alpha, beta)
+        s, ref = blend_predict_and_reference(s_pred, ref_s, alpha, beta)
 
         d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
 
@@ -341,9 +353,9 @@ def STinference(text, ref_s, ref_text, alpha = 0.3, beta = 0.7, diffusion_steps=
             c_frame += int(pred_dur[i].data)
 
         # encode prosody
-        en = get_en(d.transpose(-1, -2), pred_aln_trg, torch.float32)
+        en = get_input_for_prosody(d.transpose(-1, -2), pred_aln_trg, torch.float32)
         F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
-        asr = get_en(t_en, pred_aln_trg, USE_DTYPE)
+        asr = get_input_for_prosody(t_en, pred_aln_trg, USE_DTYPE)
         out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
     return out.squeeze().cpu().numpy()[..., :-50] # weird pulse at the end of the model, need to be fixed later
 
@@ -369,8 +381,9 @@ def main():
   #reference_dicts['908-157963-0027'] = "Demo/reference_audio/908-157963-0027.wav"
   #reference_dicts['matt2'] = "matt2.wav"
   #reference_dicts['attenb2'] = "audios/attenb2.wav"
-  reference_dicts['trent_84_6s'] = "audios/trent_84_6s.wav"
-  
+  #reference_dicts['trent_84_6s'] = "audios/trent_84_6s.wav"
+  reference_dicts['eminem'] = "audios/eminem3.wav"
+
   #This setting uses 70% of the reference timbre and 30% of the reference prosody
   # alpha=0.3, beta=0.7,
   print(GPU_DEVICE)
@@ -383,34 +396,34 @@ def main():
     # for style_k, style_path in reference_dicts.items()
     for text in texts:
         print(style_k)
-        start_all = time.monotonic()
-        ref_s = styles.get(style_k)
-        if ref_s is None:
-            ref_s = compute_style(style_path)
+        with Timed("synthesize audio from text"):
+            ref_s = styles.get(style_k)
+            if ref_s is None:
+                ref_s = compute_style(style_path)
+            
+            start = time.time()
+            if style_k == 'matt':
+                wav = inference(text, ref_s, alpha=0.1, beta=0.3, diffusion_steps=10, embedding_scale=1)
+            else:
+                with profile(activities=[ProfilerActivity.CPU], record_shapes=True, profile_memory=False) as prof:
+                    with record_function("model_inference"):
+                        wav = inference(text, ref_s, alpha=0.3, beta=0.7, diffusion_steps=5, embedding_scale=1)
+
+            inference_s = (time.time() - start)
+            duration_maybe = len(wav) / 24000
+            rtf = inference_s / duration_maybe
+            print(f"infer:duration ratio = {rtf:.2f} ; {inference_s:.2f} ; duration? {duration_maybe:.2f}")
+
+            #torchaudio.save("./synthesized.wav", wav, 24000)
+
+            sf.write("./synthesized.wav", wav, 24000)
+            print(style_k + ' Synthesized:')
+            #display(ipd.Audio(wav, rate=24000, normalize=False))
+            print('Reference:')
+            #display(ipd.Audio(path, rate=24000, normalize=False))
+            # subprocess to afplay
         
-        start = time.time()
-        if style_k == 'matt':
-            wav = inference(text, ref_s, alpha=0.1, beta=0.3, diffusion_steps=10, embedding_scale=1)
-        else:
-            with profile(activities=[ProfilerActivity.CPU], record_shapes=True, profile_memory=False) as prof:
-                with record_function("model_inference"):
-                    wav = inference(text, ref_s, alpha=0.3, beta=0.7, diffusion_steps=5, embedding_scale=1)
 
-        inference_s = (time.time() - start)
-        duration_maybe = len(wav) / 24000
-        rtf = inference_s / duration_maybe
-        print(f"infer:duration ratio = {rtf:.2f} ; {inference_s:.2f} ; duration? {duration_maybe:.2f}")
-
-        #torchaudio.save("./synthesized.wav", wav, 24000)
-
-        sf.write("./synthesized.wav", wav, 24000)
-        print(style_k + ' Synthesized:')
-        #display(ipd.Audio(wav, rate=24000, normalize=False))
-        print('Reference:')
-        #display(ipd.Audio(path, rate=24000, normalize=False))
-        # subprocess to afplay
-        duration_ms = 1000*(time.monotonic() - start_all)
-        print(f"Total time = {duration_ms:.2f}ms")
         subprocess.run(["afplay", "./synthesized.wav"])
         #print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=12))
         #print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=12))
@@ -429,4 +442,5 @@ def main():
     texts = text.strip().split('. ')
 
 if __name__ == "__main__":
+    Timed.setup_interrupt_handler()
     main()
