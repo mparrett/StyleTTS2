@@ -99,7 +99,8 @@ plbert = load_plbert(BERT_path)
 
 model_params = recursive_munch(config['model_params'])
 
-USE_FP16 = USE_MPS and True and False
+FP16_ENABLE = False # False
+USE_FP16 = USE_MPS and FP16_ENABLE
 USE_DTYPE=torch.float16 if USE_FP16 else torch.float32
 
 model = build_model(model_params, text_aligner, pitch_extractor, plbert, use_fp16=USE_FP16)
@@ -115,19 +116,22 @@ def update_model_params(model):
 
     params_whole = torch.load("Models/LibriTTS/epochs_2nd_00020.pth", map_location='cpu')  # not sure about map location cpu here
     params = params_whole['net']
-
+    def fix_state_dict(state_dict):
+        new_state_dict = OrderedDict()
+        for style_k, v in state_dict.items():
+            name = style_k[7:] # remove `module.`
+            new_state_dict[name] = v
+        return new_state_dict
     for key in model:
         if key in params:
             print('%s loaded' % key)
             try:
                 model[key].load_state_dict(params[key])
-            except:
+            except Exception as e:
+                print(e) # e.g. Error(s) in loading state_dict for StyleEncoder; Missing key(s) in state_dict: "shared.0.weight_orig", "shared.0.weight", "shared.0.weight_u"...
                 from collections import OrderedDict
                 state_dict = params[key]
-                new_state_dict = OrderedDict()
-                for style_k, v in state_dict.items():
-                    name = style_k[7:] # remove `module.`
-                    new_state_dict[name] = v
+                new_state_dict = fix_state_dict(state_dict)
                 # load params
                 model[key].load_state_dict(new_state_dict, strict=False)
     #             except:
@@ -219,8 +223,9 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
         input_lengths = input_lengths.to(GPU_DEVICE)
         t_en = t_en.to(GPU_DEVICE)
 
-        bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
-        d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
+        with Timed("bert duration"):
+            bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
+            d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
         noise = torch.randn((1, 256)).unsqueeze(1).to(GPU_DEVICE)
         # ref_s: reference from the same speaker as the embedding
@@ -240,9 +245,10 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
         pred_aln_trg = update_align_target(pred_aln_trg, pred_dur)
 
         # encode prosody
-        en = get_input_for_prosody(d.transpose(-1, -2), pred_aln_trg, torch.float32)
-        F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
-        asr = get_input_for_prosody(t_en, pred_aln_trg, USE_DTYPE)
+        with Timed("Prosody"):
+            en = get_input_for_prosody(d.transpose(-1, -2), pred_aln_trg, torch.float32)
+            F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+            asr = get_input_for_prosody(t_en, pred_aln_trg, USE_DTYPE)
 
         with Timed("model.decoder"):
             out = model.decoder(asr, F0_pred.to(USE_DTYPE), N_pred.to(USE_DTYPE),
@@ -251,7 +257,7 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
     return out.type(torch.float32).squeeze().cpu().numpy()[..., :-50] # weird pulse at the end of the model, need to be fixed later
 
 
-@Timed()
+@Timed("LFInference")
 def LFinference(text, s_prev, ref_s, alpha = 0.3, beta = 0.7, t = 0.7, diffusion_steps=5, embedding_scale=1):
   tokens = tokenize(text, GPU_DEVICE)
 
@@ -296,7 +302,8 @@ def LFinference(text, s_prev, ref_s, alpha = 0.3, beta = 0.7, t = 0.7, diffusion
       F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
       en = get_input_for_prosody(t_en, pred_aln_trg, USE_DTYPE)
       asr = (t_en @ pred_aln_trg.unsqueeze(0).to(GPU_DEVICE))
-      out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+      with Timed("model.decoder"):
+        out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
   return out.squeeze().cpu().numpy()[..., :-100], s_pred # weird pulse at the end of the model, need to be fixed later
 
 @Timed()
@@ -311,7 +318,7 @@ def tokenize_st(text, gpu_device):
     tokens = torch.LongTensor(tokens).to(gpu_device).unsqueeze(0)
     return tokens
 
-@Timed()
+@Timed("STinference")
 def STinference(text, ref_s, ref_text, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1):
     tokens = tokenize_st(text, GPU_DEVICE)
     ref_tokens = tokenize_st(ref_text, GPU_DEVICE)
@@ -356,7 +363,8 @@ def STinference(text, ref_s, ref_text, alpha = 0.3, beta = 0.7, diffusion_steps=
         en = get_input_for_prosody(d.transpose(-1, -2), pred_aln_trg, torch.float32)
         F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
         asr = get_input_for_prosody(t_en, pred_aln_trg, USE_DTYPE)
-        out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+        with Timed("model.decoder"):
+            out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
     return out.squeeze().cpu().numpy()[..., :-50] # weird pulse at the end of the model, need to be fixed later
 
 

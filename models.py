@@ -302,14 +302,14 @@ class TextEncoder(nn.Module):
 
         padding = (kernel_size - 1) // 2
         self.cnn = nn.ModuleList()
-        print(f"Depth of TextEncoder: {depth}")
+        print(f"Depth of TextEncoder: {depth}")  # 3
         training = False
         for _ in range(depth):
             self.cnn.append(nn.Sequential(
                 weight_norm(nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)),
                 LayerNorm(channels),
                 actv,
-                nn.Dropout(0.2) if training else nn.Identity(),  # probably not 
+                nn.Dropout(0.2) if training else nn.Identity(),  # probably not used outside of training
             ))
         # self.cnn = nn.Sequential(*self.cnn)
 
